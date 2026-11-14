@@ -21,12 +21,22 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from .db import MAX_ARTICLES, connect, get_meta, init_db
 from .schemas import BatchRequest, BatchResponse
+from .sync import (
+    MAX_BATCHES_PER_PAGE,
+    InvalidCursor,
+    SnapshotRequired,
+    build_changes,
+    build_snapshot,
+    decode_cursor,
+    read_sync_state,
+)
 from .worker import CompareWorker
 
 logging.basicConfig(
@@ -78,12 +88,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Corpus Contamination Checker",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Detects near-duplicate articles (5-char shingle Jaccard >= 0.8) "
         "across train/test corpora. Results are computed in the background, "
         "persisted per corpus generation and served only when they cover "
-        "the whole committed corpus."
+        "the whole committed corpus.\n\n"
+        "Offline corpora are kept in sync through `GET /sync/snapshot` "
+        "(all articles + continuation cursor in one committed view) and "
+        "`GET /sync/changes` (committed modification batches in commit "
+        "order, at most 10 complete batches per page)."
     ),
     lifespan=lifespan,
 )
@@ -118,11 +132,13 @@ def apply_batch(req: BatchRequest):
     try:
         if not req.upserts and not req.deletes:
             current, published = get_meta(conn)
+            _, last_seq = read_sync_state(conn)
             count = conn.execute("SELECT COUNT(*) AS c FROM articles").fetchone()["c"]
             return BatchResponse(
                 changed=False,
                 generation=current,
                 published_generation=published,
+                change_seq=last_seq,
                 upserted=0,
                 deleted=0,
                 articles=count,
@@ -133,10 +149,24 @@ def apply_batch(req: BatchRequest):
             current, _ = get_meta(conn)
             new_generation = current + 1
 
+            # The change record is written in this same transaction: a
+            # committed batch and its change-feed entry either both exist
+            # or neither does. seq is assigned here (under the write lock),
+            # so it reflects commit order across concurrent instances.
+            committed_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            conn.execute(
+                "INSERT INTO change_batches (generation, committed_at) VALUES (?, ?)",
+                (new_generation, committed_at),
+            )
+            seq = conn.execute("SELECT last_insert_rowid() AS s").fetchone()["s"]
+
             deleted = 0
+            deleted_ids = []
             for article_id in req.deletes:
                 cur = conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
-                deleted += cur.rowcount
+                if cur.rowcount:
+                    deleted += cur.rowcount
+                    deleted_ids.append(article_id)
             for u in req.upserts:
                 conn.execute(
                     """
@@ -158,6 +188,17 @@ def apply_batch(req: BatchRequest):
                     f"(max {MAX_ARTICLES}); whole batch rolled back",
                 )
 
+            conn.executemany(
+                "INSERT INTO change_upserts (seq, id, side, text) VALUES (?, ?, ?, ?)",
+                [(seq, u.id, u.side, u.text) for u in req.upserts],
+            )
+            conn.executemany(
+                "INSERT INTO change_deletes (seq, id) VALUES (?, ?)",
+                [(seq, article_id) for article_id in deleted_ids],
+            )
+            conn.execute(
+                "UPDATE sync_state SET last_seq = ? WHERE id = 1", (seq,)
+            )
             conn.execute(
                 "UPDATE meta SET current_generation = ? WHERE id = 1", (new_generation,)
             )
@@ -173,8 +214,9 @@ def apply_batch(req: BatchRequest):
 
         _, published = get_meta(conn)
         log.info(
-            "batch committed: generation=%d upserts=%d deleted=%d articles=%d",
+            "batch committed: generation=%d seq=%d upserts=%d deleted=%d articles=%d",
             new_generation,
+            seq,
             len(req.upserts),
             deleted,
             count,
@@ -183,6 +225,7 @@ def apply_batch(req: BatchRequest):
             changed=True,
             generation=new_generation,
             published_generation=published,
+            change_seq=seq,
             upserted=len(req.upserts),
             deleted=deleted,
             articles=count,
@@ -193,6 +236,85 @@ def apply_batch(req: BatchRequest):
         raise HTTPException(422, f"batch rejected, nothing applied: {exc}")
     finally:
         conn.close()
+
+
+@app.get("/sync/snapshot")
+def sync_snapshot():
+    """Full committed corpus plus the cursor that continues from it.
+
+    Articles, change sequence number and cursor are read in one SQLite read
+    transaction, so the cursor can only ever denote the same committed view
+    that produced the articles. The cursor is therefore never paired with a
+    different generation's content.
+    """
+    conn = connect(DB_PATH)
+    try:
+        conn.execute("BEGIN")
+        payload = build_snapshot(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    return payload
+
+
+@app.get(
+    "/sync/changes",
+    responses={
+        400: {"description": "Malformed cursor (not issued by this service)"},
+        409: {
+            "description": (
+                "Cursor cannot be continued (different database identity, "
+                "change log behind the cursor, or truncated history); "
+                "fetch GET /sync/snapshot"
+            )
+        },
+    },
+)
+def sync_changes(
+    cursor: str = Query(..., description="Continuation cursor from a snapshot or a previous page"),
+    limit: int = Query(
+        MAX_BATCHES_PER_PAGE,
+        ge=1,
+        le=MAX_BATCHES_PER_PAGE,
+        description="Maximum complete batches per page (hard cap: 10)",
+    ),
+):
+    """Committed modification batches after ``cursor``, in commit order.
+
+    Each page holds at most 10 complete batches (never a partial batch); both
+    upserted articles (with their new side and full new text) and deleted
+    article IDs are included. The response cursor advances only over batches
+    actually returned, so confirmed batches are never replayed and later
+    batches are never skipped or reordered.
+
+    A cursor that cannot be continued (another database identity, change log
+    behind it, or truncated history) yields ``409 snapshot_required``; a
+    malformed token yields ``400``.
+    """
+    try:
+        parsed = decode_cursor(cursor)
+    except InvalidCursor as exc:
+        raise HTTPException(400, f"invalid cursor: {exc}")
+
+    conn = connect(DB_PATH)
+    try:
+        conn.execute("BEGIN")
+        try:
+            payload = build_changes(conn, parsed, limit)
+        except SnapshotRequired as exc:
+            conn.rollback()
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "status": "snapshot_required",
+                    "detail": str(exc),
+                    "action": "GET /sync/snapshot",
+                },
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return payload
 
 
 @app.get("/articles")

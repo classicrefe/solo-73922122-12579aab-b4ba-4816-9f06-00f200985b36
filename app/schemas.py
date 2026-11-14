@@ -32,6 +32,7 @@ class BatchResponse(BaseModel):
     changed: bool
     generation: int
     published_generation: int
+    change_seq: int
     upserted: int
     deleted: int
     articles: int

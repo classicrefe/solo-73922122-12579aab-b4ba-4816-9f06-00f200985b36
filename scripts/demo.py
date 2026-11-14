@@ -10,6 +10,9 @@ bridge      delete the bridge article -> its contamination group splits;
 concurrent  submit batches while a background comparison is running:
             the API keeps accepting writes, answers 202 until verification
             covers the latest corpus, and stale computations are discarded
+sync        take a full snapshot + cursor, page committed batches (re-home,
+            new text, deletion) while more batches are written, and prove
+            paging never replays or skips a batch
 restart     submit a batch, restart the API processes, and watch
             verification complete automatically after the restart
 
@@ -29,6 +32,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.similarity import jaccard, shingles  # noqa: E402
+from app.sync import decode_cursor  # noqa: E402
 
 DEFAULT_BASE = os.environ.get("BASE_URL", "http://localhost:8001")
 
@@ -326,6 +330,70 @@ def scenario_concurrent(base):
     print("concurrent scenario done.\n")
 
 
+def scenario_sync(base):
+    print("== sync: incremental delivery to an offline training corpus ==")
+    reset_to_seed(base)
+
+    code, snap = http(base, "GET", "/sync/snapshot")
+    expect(code == 200, f"snapshot returned all {snap['article_count']} committed articles")
+    cursor = snap["cursor"]
+    expect(snap["article_count"] == 7, "snapshot contains the whole seeded corpus")
+    print(f"  snapshot cursor: ...{cursor[-24:]}  (change_seq={snap['change_seq']})")
+
+    # A revision (re-home + new text) and a deletion, each its own batch.
+    revised = {"id": "train-clean-1", "side": "test",
+               "text": "an updated article now assigned to the test side"}
+    code, body = http(base, "POST", "/articles/batch", {"upserts": [revised]})
+    expect(code == 200, f"revision committed (batch seq {body['change_seq']})")
+    seq_rev = body["change_seq"]
+
+    code, body = http(base, "POST", "/articles/batch", {"deletes": ["test-clean-1"]})
+    expect(code == 200, f"deletion committed (batch seq {body['change_seq']})")
+    seq_del = body["change_seq"]
+
+    code, page = http(base, "GET", f"/sync/changes?cursor={cursor}")
+    expect(code == 200, "changes page after the snapshot cursor")
+    expect([b["seq"] for b in page["batches"]] == [seq_rev, seq_del],
+           "both batches delivered in commit order")
+    expect(page["batches"][0]["upserts"] == [revised],
+           "revision batch carries the new side and full new text")
+    expect(page["batches"][1]["deletes"] == ["test-clean-1"],
+           "deletion batch carries the deleted article id")
+    expect(page["batch_count"] <= 10, "page holds at most 10 batches")
+    expect(page["has_more"] is False, "no further batches yet")
+
+    # Write more batches *after* the consumer started reading, then continue.
+    cursor = page["cursor"]
+    added = []
+    for i in range(3):
+        code, body = http(
+            base, "POST", "/articles/batch",
+            {"upserts": [{"id": f"sync-new-{i}", "side": "train",
+                          "text": f"fresh sync article number {i} with unique words"}]},
+        )
+        expect(code == 200, f"post-snapshot batch {i} committed")
+        added.append(body["change_seq"])
+
+    code, page = http(base, "GET", f"/sync/changes?cursor={cursor}")
+    expect(code == 200, "continued paging from the previous page cursor")
+    expect([b["seq"] for b in page["batches"]] == added,
+           "only the new batches are delivered -- no replay of confirmed ones")
+    expect(page["batches"][0]["seq"] > cursor_seq(cursor),
+           "the new page starts strictly after the confirmed cursor")
+
+    code, body = http(base, "GET", f"/sync/changes?cursor={page['cursor']}")
+    expect(body["batches"] == [], "paging again at the latest cursor returns nothing")
+
+    # A cursor the service cannot continue must say so explicitly.
+    code, body = http(base, "GET", "/sync/changes?cursor=not-a-real-cursor")
+    expect(code == 400, "malformed cursor is rejected (400)")
+    print("sync scenario done.\n")
+
+
+def cursor_seq(cursor):
+    return decode_cursor(cursor).seq
+
+
 def scenario_restart(base, restart_cmd):
     print("== restart: verification resumes automatically after a restart ==")
     reset_to_seed(base)
@@ -371,7 +439,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "scenario",
-        choices=["seed", "bridge", "concurrent", "restart", "all", "wait", "status"],
+        choices=["seed", "bridge", "concurrent", "sync", "restart", "all", "wait", "status"],
     )
     parser.add_argument("--base", default=DEFAULT_BASE, help="API base URL")
     parser.add_argument(
@@ -394,12 +462,15 @@ def main():
         scenario_bridge(base)
     elif args.scenario == "concurrent":
         scenario_concurrent(base)
+    elif args.scenario == "sync":
+        scenario_sync(base)
     elif args.scenario == "restart":
         scenario_restart(base, args.restart_cmd)
     elif args.scenario == "all":
         scenario_seed(base)
         scenario_bridge(base)
         scenario_concurrent(base)
+        scenario_sync(base)
         scenario_restart(base, args.restart_cmd)
 
 
